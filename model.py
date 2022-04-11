@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import logging
@@ -12,6 +13,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+from numpy import mean
+from tqdm import tqdm
 
 from storage.manager import StorageManager
 
@@ -26,12 +29,22 @@ def weights_init(m):
         nn.init.constant_(m.bias.data, 0)
 
 class MetricsMonitor:
+    header = ["epoch", "epochs", "batch", "batches", "d_loss", "g_loss", "d_x", "d_g_z1", "d_g_z2"]
     def __init__(self) -> None:
         self.metrics = list()
 
+    def clear(self):
+        self.metrics.clear()
+
     def add_metrics(self, epoch, epochs, batch, batches, d_loss, g_loss, d_x, d_g_z1, d_g_z2):
         self.metrics.append([epoch, epochs, batch, batches, d_loss, g_loss, d_x, d_g_z1, d_g_z2])
-        logging.info(f"{epoch}/{epochs} {batch}/{batches} D_Loss: {d_loss:.4f} D(x): {d_x:.4f} D(G(z)): {d_g_z1:.4f}/{d_g_z2:.4f}")
+        # logging.info(f"{epoch}/{epochs} {batch}/{batches} D_Loss: {d_loss:.4f} D(x): {d_x:.4f} D(G(z)): {d_g_z1:.4f}/{d_g_z2:.4f}")
+
+    def get_losses(self):
+        d_losses = [m[4] for m in self.metrics]
+        g_losses = [m[5] for m in self.metrics]
+
+        return d_losses, g_losses
 
 class DCGAN_1024:
     def __init__(
@@ -72,6 +85,7 @@ class DCGAN_1024:
         self.eval_epoch_frequency = eval_epoch_frequency
 
         self.timestamp = datetime.utcnow()
+        self.metrics_monitor = MetricsMonitor()
         self.device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
         self.training_data_path = os.path.join(data_root, data_target, self.timestamp.strftime("%Y%m%dT%H%M%SZ"))
         self.storage_manager = StorageManager(self.training_data_path)
@@ -106,7 +120,7 @@ class DCGAN_1024:
         logging.info("Building dataloader")
         source_data_path = os.path.join(data_root, data_source)
         self.dataloader = self.build_dataloader(source_data_path, image_size, batch_size, dataloader_workers)
-        self.write_samples(self.dataloader.dataset, "target.png", convert_fn=self.dataset_to_plots)
+        self.write_samples(self.dataloader.dataset, "target.png", convert_fn=self.dataset_to_plot)
 
         logging.info("Building generator")
         self.generator = Generator_1024(ngpu, image_channels, g_latent_vector_size, g_feature_map_filters, g_conv_kernel_size, g_conv_stride)
@@ -159,12 +173,18 @@ class DCGAN_1024:
         eval_latent_vector = torch.randn(64, self.latent_vector_size, 1, 1, device=self.device)
         with torch.no_grad():
             fake = self.generator(eval_latent_vector).detach().cpu()
-        self.write_samples(fake, "initial.png", convert_fn=self.prediction_to_plots)
+        self.write_samples(fake, "initial.png", convert_fn=self.prediction_to_plot)
 
-        metrics_monitor = MetricsMonitor()
+        self.metrics_monitor.clear()
+        train_start_date_time_utc = datetime.utcnow()
 
         for epoch in range(self.epochs):
-            for batch, data in enumerate(self.dataloader, 0):
+            d_loss_mean = []
+            g_loss_mean = []
+
+            stream = tqdm(self.dataloader)
+            for batch, data in enumerate(stream):
+
                 self.discriminator.zero_grad()
 
                 # Train discriminator with real images
@@ -198,14 +218,25 @@ class DCGAN_1024:
                 g_x = output.mean().item()
                 g_optimizer.step()
 
-                metrics_monitor.add_metrics(epoch + 1, self.epochs, batch + 1, len(self.dataloader), d_err.item(), g_err.item(), d_x_real, d_x_fake, g_x)
+                d_loss = d_err.item()
+                g_loss = g_err.item()
+                d_loss_mean.append(d_loss)
+                g_loss_mean.append(g_loss)
+
+                self.metrics_monitor.add_metrics(epoch + 1, self.epochs, batch + 1, len(self.dataloader), d_loss, g_loss, d_x_real, d_x_fake, g_x)
+
+                stream.set_description(f"[{epoch + 1}/{self.epochs}] d_loss: {mean(d_loss_mean):.2f}, g_loss: {mean(g_loss_mean):.2f}")
+
+            logging.info(f"Epoch {epoch + 1} elapsed time: {datetime.utcnow() - train_start_date_time_utc}")
 
             if (epoch + 1) % self.eval_epoch_frequency == 0 or (epoch + 1) == self.epochs:
                 with torch.no_grad():
                     fake = self.generator(eval_latent_vector).detach().cpu()
-                self.write_samples(fake, "generated.png", epoch=(epoch + 1), convert_fn=self.prediction_to_plots)
+                self.write_samples(fake, "generated.png", epoch=(epoch + 1), convert_fn=self.prediction_to_plot)
+                self.write_metrics(epoch + 1)
+                # TODO: write model weights to storage
 
-    def dataset_to_plots(self, samples, sample_count):
+    def dataset_to_plot(self, samples, sample_count):
         plots = list()
         for i in range(sample_count):
             sample = samples[i][0]
@@ -214,7 +245,7 @@ class DCGAN_1024:
             plots.append(sample)
         return plots
 
-    def prediction_to_plots(self, samples, sample_count):
+    def prediction_to_plot(self, samples, sample_count):
         plots = list()
         for i in range(sample_count):
             sample = samples[i]
@@ -242,9 +273,37 @@ class DCGAN_1024:
 
         path_parts = list()
         if epoch != None:
+            path_parts.append("epoch")
             path_parts.append(str(epoch))
 
         self.storage_manager.write_bytes(filename, buffer.getvalue(), path_parts=path_parts)
+
+    def write_metrics(self, epoch):
+        path_parts = ["epoch", str(epoch)]
+
+        d_losses, g_losses = self.metrics_monitor.get_losses()
+
+        plt.figure(figsize=(10,5))
+        plt.title("Generator and Discriminator Loss")
+        plt.plot(g_losses, label="G-Loss")
+        plt.plot(d_losses, label="D-Loss")
+        plt.xlabel("Iterations")
+        plt.ylabel("Loss")
+        plt.legend()
+
+        plot_buffer = io.BytesIO()
+        plt.savefig(plot_buffer)
+        plt.close()
+        plot_buffer.seek(0)
+
+        self.storage_manager.write_bytes("loss.png", plot_buffer.getvalue(), path_parts=path_parts)
+
+        metrics_buffer = io.StringIO()
+        writer = csv.writer(metrics_buffer)
+        writer.writerow(self.metrics_monitor.header)
+        writer.writerows(self.metrics_monitor.metrics)
+
+        self.storage_manager.write_bytes("metrics.csv", metrics_buffer.getvalue().encode(), path_parts=path_parts)
 
     def write_training_parameters(
         self,
