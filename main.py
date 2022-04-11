@@ -18,7 +18,7 @@ if __name__ == '__main__':
     parser.add_argument("--data_source_dir", type=str, default="01-cur")
     parser.add_argument("--data_target_dir", type=str, default="02-trn")
     parser.add_argument("--dataloader_workers", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=0.0002)
     parser.add_argument("--adam_beta_1", type=float, default=0.5)
@@ -33,6 +33,8 @@ if __name__ == '__main__':
     parser.add_argument("--d_conv_kernel_size", type=int, default=4)
     parser.add_argument("--d_conv_stride", type=int, default=2)
     parser.add_argument("--d_activation_negative_slope", type=float, default=0.2)
+    parser.add_argument("--eval_sample_count", type=int, default=64)
+    parser.add_argument("--eval_epoch_frequency", type=int, default=10)
     parser.add_argument('--train', action='store_true', help='Train the model')
     args = parser.parse_args()
 
@@ -59,7 +61,9 @@ if __name__ == '__main__':
         args.d_feature_map_filters,
         args.d_conv_kernel_size,
         args.d_conv_stride,
-        args.d_activation_negative_slope
+        args.d_activation_negative_slope,
+        args.eval_sample_count,
+        args.eval_epoch_frequency
     )
 
     if args.train:

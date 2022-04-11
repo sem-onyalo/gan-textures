@@ -11,3 +11,17 @@ python -m venv env
 
 pip install -r requirements.txt
 ```
+
+## Run
+
+### Test Model Initialization
+
+```
+python main.py
+```
+
+### Train Model
+
+```
+python main.py --epochs 10
+```

@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import math
 import os
 import random
 from datetime import datetime
@@ -13,6 +14,8 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
 from storage.manager import StorageManager
+
+MAX_EVAL_SAMPLE_COUNT = 100
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -53,7 +56,9 @@ class DCGAN_1024:
         d_feature_map_filters,
         d_conv_kernel_size,
         d_conv_stride,
-        d_activation_negative_slope
+        d_activation_negative_slope,
+        eval_sample_count,
+        eval_epoch_frequency
     ):
         random.seed(seed)
         torch.manual_seed(seed)
@@ -63,12 +68,13 @@ class DCGAN_1024:
         self.adam_beta_1 = adam_beta_1
         self.adam_beta_2 = adam_beta_2
         self.latent_vector_size = g_latent_vector_size
+        self.eval_sample_count = eval_sample_count if eval_sample_count <= MAX_EVAL_SAMPLE_COUNT else MAX_EVAL_SAMPLE_COUNT
+        self.eval_epoch_frequency = eval_epoch_frequency
 
         self.timestamp = datetime.utcnow()
         self.device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
         self.training_data_path = os.path.join(data_root, data_target, self.timestamp.strftime("%Y%m%dT%H%M%SZ"))
         self.storage_manager = StorageManager(self.training_data_path)
-        logging.info(f"Training data directory: {self.training_data_path}")
 
         self.write_training_parameters(
             self.timestamp.strftime("%Y%m%dT%H%M%SZ"),
@@ -92,29 +98,32 @@ class DCGAN_1024:
             d_feature_map_filters,
             d_conv_kernel_size,
             d_conv_stride,
-            d_activation_negative_slope
+            d_activation_negative_slope,
+            eval_sample_count,
+            eval_epoch_frequency
         )
 
         logging.info("Building dataloader")
         source_data_path = os.path.join(data_root, data_source)
         self.dataloader = self.build_dataloader(source_data_path, image_size, batch_size, dataloader_workers)
-        self.write_samples(self.dataloader.dataset, "target.png")
+        self.write_samples(self.dataloader.dataset, "target.png", convert_fn=self.dataset_to_plots)
 
-        logging.info("Creating generator")
+        logging.info("Building generator")
         self.generator = Generator_1024(ngpu, image_channels, g_latent_vector_size, g_feature_map_filters, g_conv_kernel_size, g_conv_stride)
         if self.device.type == "cuda" and ngpu > 1:
             self.generator = nn.DataParallel(self.generator, list(range(ngpu)))
         self.generator.apply(weights_init)
-        logging.info(f"Generator:\n{self.generator}")
+        logging.debug(f"Generator:\n{self.generator}")
 
-        logging.info("Creating discriminator")
+        logging.info("Building discriminator")
         self.discriminator = Discriminator_1024(ngpu, image_channels, d_feature_map_filters, d_conv_kernel_size, d_conv_stride, d_activation_negative_slope)
         if self.device.type == "cuda" and ngpu > 1:
             self.discriminator = nn.DataParallel(self.discriminator, list(range(ngpu)))
         self.discriminator.apply(weights_init)
-        logging.info(f"Discriminator:\n{self.discriminator}")
+        logging.debug(f"Discriminator:\n{self.discriminator}")
 
-        logging.info("Setup complete")
+        logging.info(f"Training data directory: {self.training_data_path}")
+        logging.info("Model init complete")
         logging.info("-" * 50)
 
     def build_dataloader(self, data_root, image_size, batch_size, workers):
@@ -141,10 +150,16 @@ class DCGAN_1024:
         real_label = 1.
         fake_label = 0.
 
+        logging.info("Initializing optimizers")
         criterion = nn.BCELoss()
-        latent_vector_eval = torch.randn(64, self.latent_vector_size, 1, 1, device=self.device)
         g_optimizer = optim.Adam(self.generator.parameters(), lr=self.learning_rate, betas=(self.adam_beta_1, self.adam_beta_2))
         d_optimizer = optim.Adam(self.discriminator.parameters(), lr=self.learning_rate, betas=(self.adam_beta_1, self.adam_beta_2))
+
+        logging.info("Generating initial samples")
+        eval_latent_vector = torch.randn(64, self.latent_vector_size, 1, 1, device=self.device)
+        with torch.no_grad():
+            fake = self.generator(eval_latent_vector).detach().cpu()
+        self.write_samples(fake, "initial.png", convert_fn=self.prediction_to_plots)
 
         metrics_monitor = MetricsMonitor()
 
@@ -185,20 +200,38 @@ class DCGAN_1024:
 
                 metrics_monitor.add_metrics(epoch + 1, self.epochs, batch + 1, len(self.dataloader), d_err.item(), g_err.item(), d_x_real, d_x_fake, g_x)
 
-    def tensors_to_plots(self, samples, grid_dim=10):
+            if (epoch + 1) % self.eval_epoch_frequency == 0 or (epoch + 1) == self.epochs:
+                with torch.no_grad():
+                    fake = self.generator(eval_latent_vector).detach().cpu()
+                self.write_samples(fake, "generated.png", epoch=(epoch + 1), convert_fn=self.prediction_to_plots)
+
+    def dataset_to_plots(self, samples, sample_count):
         plots = list()
-        for i in range(grid_dim * grid_dim):
+        for i in range(sample_count):
             sample = samples[i][0]
             sample = (sample + 1) / 2.0 # scale from -1,1 to 0,1
             sample = sample.permute(1, 2, 0)
             plots.append(sample)
         return plots
 
-    def write_samples(self, dataset, target_path, grid_dim=10, fig_dim=20):
-        samples = self.tensors_to_plots(dataset, grid_dim)
+    def prediction_to_plots(self, samples, sample_count):
+        plots = list()
+        for i in range(sample_count):
+            sample = samples[i]
+            sample = (sample + 1) / 2.0 # scale from -1,1 to 0,1
+            sample = sample.permute(1, 2, 0)
+            plots.append(sample)
+        return plots
+
+    def write_samples(self, samples, filename, fig_dim=20, epoch=None, convert_fn=None):
+        sample_count = self.eval_sample_count if self.eval_sample_count <= len(samples) else len(samples)
+        grid_dim = math.floor(math.sqrt(sample_count))
+
+        if convert_fn != None:
+            samples = convert_fn(samples, grid_dim ** 2)
 
         plt.figure(figsize=(fig_dim, fig_dim))
-        for i in range(grid_dim * grid_dim):
+        for i in range(grid_dim ** 2):
             plt.subplot(grid_dim, grid_dim, i + 1)
             plt.axis("off")
             plt.imshow(samples[i]) # TODO: set gray based on function param
@@ -207,7 +240,11 @@ class DCGAN_1024:
         plt.savefig(buffer)
         plt.close()
 
-        self.storage_manager.write_bytes(target_path, buffer.getvalue())
+        path_parts = list()
+        if epoch != None:
+            path_parts.append(str(epoch))
+
+        self.storage_manager.write_bytes(filename, buffer.getvalue(), path_parts=path_parts)
 
     def write_training_parameters(
         self,
@@ -232,7 +269,9 @@ class DCGAN_1024:
         d_feature_map_filters,
         d_conv_kernel_size,
         d_conv_stride,
-        d_activation_negative_slope
+        d_activation_negative_slope,
+        eval_sample_count,
+        eval_epoch_frequency
     ):
         training_parameters = {
             "timestamp": timestamp,
@@ -256,7 +295,9 @@ class DCGAN_1024:
             "d_feature_map_filters": d_feature_map_filters,
             "d_conv_kernel_size": d_conv_kernel_size,
             "d_conv_stride": d_conv_stride,
-            "d_activation_negative_slope": d_activation_negative_slope
+            "d_activation_negative_slope": d_activation_negative_slope,
+            "eval_sample_count": eval_sample_count,
+            "eval_epoch_frequency": eval_epoch_frequency
         }
         
         buffer = json.dumps(training_parameters, indent=4).encode()
